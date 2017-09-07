@@ -5,6 +5,8 @@ import subprocess
 import threading
 import re
 
+from concurrent import futures
+from threading import RLock
 
 import xml.etree.ElementTree as etree
 
@@ -18,15 +20,25 @@ auto_complete = True
 fixits = False
 
 
-def run_rc(switches, input=None, *args):
+def run_rc(switches, input=None, quote=True, *args):
     p = subprocess.Popen([RC_PATH] + switches + list(args),
                          stderr=subprocess.PIPE,
                          stdout=subprocess.PIPE,
                          stdin=subprocess.PIPE)
-    print(' '.join(p.args))
+    if quote:
+        print(' '.join(p.args))
     return p.communicate(input=input, timeout=rc_timeout)
 
-# TODO refactor somehow to remove global vars
+
+def get_view_text(view):
+    return bytes(view.substr(sublime.Region(0, view.size())), "utf-8")
+
+
+def supported_file_type(view):
+    if settings == None:
+        return False
+    file_types = settings.get('file_types', ["source.c", "source.c++"])
+    return view.scope_name(view.sel()[0].a).split()[0] in file_types
 
 
 class NavigationHelper(object):
@@ -72,15 +84,17 @@ class ProgressIndicator():
             self.last_view.erase_status(self.status_key)
             self.last_view = None
 
-        if not self.busy:
-            active_view.set_status(self.status_key, "RTags reindexing done")
-            sublime.set_timeout(lambda: active_view.erase_status(self.status_key), 5000)
+        # check if we are currently indexing
+        out, err = run_rc(['--is-indexing', '--silent-query'], None, False)
+        if out.decode().strip() != "1":
+            self.busy = False
+            active_view.erase_status(self.status_key)
             return
 
         before = i % self.size
         after = (self.size - 1) - before
 
-        active_view.set_status(self.status_key, 'RTags reindexing [%s=%s]' % (' ' * before, ' ' * after))
+        active_view.set_status(self.status_key, 'RTags [%s=%s]' % (' ' * before, ' ' * after))
         if self.last_view is None:
             self.last_view = active_view
 
@@ -126,6 +140,7 @@ class RConnectionThread(threading.Thread):
         for line in iter(self.p.stdout.readline, b''):
             line = line.decode('utf-8')
             self.p.poll()
+
             if not start_tag:
                 start_tag = re.findall(rgxp, line)
                 start_tag = start_tag[0] if len(start_tag) else ''
@@ -140,20 +155,28 @@ class RConnectionThread(threading.Thread):
                     # notify about event
                     sublime.set_timeout(self.notify, 10)
 
-                if (fixits and tree.tag == 'checkstyle'):
+                if fixits and (tree.tag == 'checkstyle'):
                     errors = []
+                    key = 0
                     for file in tree.findall('file'):
                         for error in file.findall('error'):
-                            if (error.attrib["severity"] == "fixit" or error.attrib["severity"] == "error"):
-                                errors.append(
-                                    "{}:{}:0:{}".format(
-                                        file.attrib["name"],
-                                        error.attrib["line"],
-                                        error.attrib["message"]))
-                    view = sublime.active_window().active_view()
-                    if (len(errors) > 0):
-                        view.run_command('rtags_fixit', {'errors': errors})
-                    progress_indicator.set_busy(False)
+                            if (error.attrib["severity"] == "fixit" or
+                                error.attrib["severity"] == "error" or
+                                error.attrib["severity"] == "warning"):
+                                errdict = {}
+                                errdict['key'] = key
+                                errdict['file'] = file.attrib["name"]
+                                errdict['severity'] = error.attrib["severity"]
+                                errdict['line'] = int(error.attrib["line"])
+                                errdict['column'] = int(error.attrib["column"])
+                                if 'length' in error.attrib:
+                                    errdict['length'] = int(error.attrib["length"])
+                                else:
+                                    errdict['length'] = -1
+                                errdict['message'] = error.attrib["message"]
+                                errors.append(errdict)
+                                key = key + 1
+                    sublime.active_window().active_view().run_command('rtags_fixit', {'errors': errors})
                 buffer = ''
                 start_tag = ''
         self.p = None
@@ -164,8 +187,120 @@ class RConnectionThread(threading.Thread):
             self.p = None
 
 
-def get_view_text(view):
-    return bytes(view.substr(sublime.Region(0, view.size())), "utf-8")
+class CompletionJob():
+    p = None
+
+    def run(self, completion_job_id, filename, text, size, row, col):
+        self.p = None
+
+        switches = []
+
+        # rc itself
+        switches.append(RC_PATH)
+
+        # auto-complete switch
+        switches.append('-l')
+
+        # the query
+        switches.append('{}:{}:{}'.format(filename, row + 1, col + 1))
+
+        switches.append('--unsaved-file')
+
+        # We launch rc utility with both filename:line:col and filename:length
+        # because we're using modified file which is passed via stdin (see --unsaved-file
+        # switch)
+        switches.append('{}:{}'.format(filename, size))
+
+        switches.append('--synchronous-completions')
+
+        self.p = subprocess.Popen(
+            switches,
+            stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE,
+            stdin=subprocess.PIPE)
+
+        out, err = self.p.communicate(input=text, timeout=rc_timeout)
+
+        suggestions = []
+        for line in out.splitlines():
+            # line is like this
+            # "process void process(CompletionThread::Request *request) CXXMethod"
+            # "reparseTime int reparseTime VarDecl"
+            # "dump String dump() CXXMethod"
+            # "request CompletionThread::Request * request ParmDecl"
+            # we want it to show as process()\tCXXMethod
+            #
+            # output is list of tuples: first tuple element is what we see in popup menu
+            # second is what inserted into file. '$0' is where to place cursor.
+            # TODO play with $1, ${2:int}, ${3:string} and so on
+            elements = line.decode('utf-8').split()
+            suggestions.append(('{}\t{}'.format(' '.join(elements[1:-1]), elements[-1]),
+                                '{}$0'.format(elements[0])))
+
+        self.p = None
+
+        return (completion_job_id, suggestions)
+
+    def stop(self):
+        self.p.kill()
+        self.p = None
+
+
+class FixitsController():
+
+    def __init__(self):
+        self.regions = []
+
+    def clear_regions(self, view):
+        for region in self.regions:
+            view.erase_regions(region['key'])
+
+    def show_regions(self, view):
+        for region in self.regions:
+            view.add_regions(region['key'], [region['region']], "string", "cross")
+
+    def hover_region(self, view, point):
+        for region in self.regions:
+            if region['region'].contains(point):
+                return region
+        return None
+
+    def cursor_region(self, view, row, col):
+        if not row:
+            return None
+
+        start = view.text_point(row, 0)
+        end = view.line(start).b
+        cursor_region = sublime.Region(start, end)
+
+        for region in self.regions:
+            if cursor_region.contains(region['region']):
+                return region
+
+        return None
+
+    def show_fixit(self, view, region):
+        view.show_popup(
+            "<nbsp/>{}<nbsp/>".format(region['message']),
+            sublime.HIDE_ON_MOUSE_MOVE_AWAY,
+            region['region'].a)
+
+    def update_regions(self, view, errors):
+
+        def errors_to_regions(error):
+            start = view.text_point(error['line']-1, error['column']-1)
+
+            if error['length'] > 0:
+                end = view.text_point(error['line']-1, error['column']-1 + error['length'])
+            else:
+                end = view.line(start).b
+
+            return {
+            "key": "RTagsErrorKey{}".format(error['key']),
+            "region": sublime.Region(start, end),
+            "message": error['message']}
+
+        self.regions = list(map(errors_to_regions, errors))
 
 
 reg = r'(\S+):(\d+):(\d+):(.*)'
@@ -193,7 +328,7 @@ class RtagsBaseCommand(sublime_plugin.TextCommand):
             # never go further
             return
 
-        out, err = run_rc(switches, None, self._query(*args, **kwargs))
+        out, err = run_rc(switches, None, True, self._query(*args, **kwargs))
         # dirty hack
         # TODO figure out why rdm responds with 'Project loading'
         # for now just repeat query
@@ -210,7 +345,7 @@ class RtagsBaseCommand(sublime_plugin.TextCommand):
         self._action(out, err)
 
     def _reindex(self, filename):
-        run_rc(['-V'], get_view_text(self.view), filename,
+        run_rc(['-V'], get_view_text(self.view), True, filename,
                '--unsaved-file', '{}:{}'.format(filename, self.view.size()))
 
     def on_select(self, res):
@@ -237,10 +372,15 @@ class RtagsBaseCommand(sublime_plugin.TextCommand):
         return ''
 
     def _validate(self, stdout, stderr):
-        if stdout != b'Not indexed\n':
-            return True
-        self.view.show_popup("<nbsp/>Not indexed<nbsp/>")
-        return False
+        # check if the file in question is not indexed by rtags
+        if stdout == b'Not indexed\n':
+            self.view.show_popup("<nbsp/>Not indexed<nbsp/>")
+            return False
+        # check if rtags is actually running
+        if stdout.decode('utf-8').startswith("Can't seem to connect to server"):
+            self.view.show_popup("<nbsp/>{}<nbsp/>".format(stdout.decode('utf-8')))
+            return False
+        return True
 
     def _action(self, stdout, stderr):
         if not self._validate(stdout, stderr):
@@ -249,8 +389,10 @@ class RtagsBaseCommand(sublime_plugin.TextCommand):
         # pretty format the results
         items = list(map(lambda x: x.decode('utf-8'), stdout.splitlines()))
         self.last_references = items
-
-        items = list(map(self.out_to_items, items))
+        def out_to_items(item):
+            (file, line, _, usage) = re.findall(reg, item)[0]
+            return [usage.strip(), "{}:{}".format(file.split('/')[-1], line)]
+        items = list(map(out_to_items, items))
 
         # if there is only one result no need to show it to user
         # just do navigation directly
@@ -261,25 +403,13 @@ class RtagsBaseCommand(sublime_plugin.TextCommand):
         self.view.window().show_quick_panel(
             items, self.on_select, sublime.MONOSPACE_FONT, -1, self.on_highlight)
 
-    def out_to_items(self, item):
-        (file, line, _, usage) = re.findall(reg, item)[0]
-        return [usage.strip(), "{}:{}".format(file.split('/')[-1], line)]
-
 
 class RtagsFixitCommand(RtagsBaseCommand):
 
     def run(self, edit, **args):
-        items = args["errors"]
-        self.last_references = items
-
-        items = list(map(self.out_to_items, items))
-
-        self.view.window().show_quick_panel(
-            items,
-            None,
-            sublime.MONOSPACE_FONT,
-            -1,
-            self.on_highlight)
+        fixits_controller.clear_regions(self.view)
+        fixits_controller.update_regions(self.view, args["errors"])
+        fixits_controller.show_regions(self.view)
 
 
 class RtagsGoBackwardCommand(sublime_plugin.TextCommand):
@@ -314,8 +444,10 @@ class RtagsSymbolInfoCommand(RtagsLocationCommand):
 
         items = list(map(lambda x: x.decode('utf-8'), out.splitlines()))
         items = list(filter(self.filter_items, items))
-
-        items = list(map(self.out_to_items, items))
+        def out_to_items(item):
+            (title, info) = re.findall(self.inforeg, item)[0]
+            return [info.strip(), title.strip()]
+        items = list(map(out_to_items, items))
         self.last_references = items
 
         self.view.window().show_quick_panel(
@@ -328,22 +460,43 @@ class RtagsSymbolInfoCommand(RtagsLocationCommand):
 
 class RtagsNavigationListener(sublime_plugin.EventListener):
 
-    def on_post_save(self, v):
+    def cursor_pos(self, view, pos=None):
+        if not pos:
+            pos = view.sel()
+            if len(pos) < 1:
+                # something is wrong
+                return None
+            # we care about the first position
+            pos = pos[0].a
+        return view.rowcol(pos)
+
+    def on_hover(self, view, point, hover_zone):
+        region = fixits_controller.hover_region(view, point)
+        if region:
+            fixits_controller.show_fixit(view, region)
+
+    def on_selection_modified(self, view):
+        (row, col) = self.cursor_pos(view)
+        region = fixits_controller.cursor_region(view, row, col)
+        if region:
+            fixits_controller.show_fixit(view, region)
+
+    def on_post_save(self, view):
         # do nothing if not called from supported code
-        if not supported_file_type(v):
+        if not supported_file_type(view):
             return
+
+        # run rc --check-reindex to reindex just saved files
+        run_rc(['-x'], None, True, view.file_name())
 
         # do nothing if we dont want to support fixits
         if not fixits:
             return
 
-        # rdm's file watcher will trigger a reindex if needed, hence
-        # all we do here is check if we are currently indexing
-        out, err = run_rc(['--is-indexing'], None)
+        # check if we are currently indexing
+        out, err = run_rc(['--is-indexing', '--silent-query'], None, False)
         if out.decode().strip() == "1":
             progress_indicator.set_busy(True)
-        # there is no need to manually trigger reindexing as
-        # this is done automagically by rdm's file watcher
 
     def on_post_text_command(self, view, command_name, args):
         # do nothing if not called from supported code
@@ -351,79 +504,80 @@ class RtagsNavigationListener(sublime_plugin.EventListener):
             return
         # if view get 'clean' after undo check if we need reindex
         if command_name == 'undo' and not view.is_dirty():
-            run_rc(['-V'], None, view.file_name())
+            run_rc(['-V'], None, False, view.file_name())
 
 
 class RtagsCompleteListener(sublime_plugin.EventListener):
     # TODO refactor
+    suggestions = []
+    completion_job_id = None
+    pool = futures.ThreadPoolExecutor(max_workers=1)
+    lock = RLock()
 
-    def _query(self, *args, **kwargs):
-        pos = args[0]
-        row, col = self.view.rowcol(pos)
-        return '{}:{}:{}'.format(self.view.file_name(),
-                                 row + 1, col + 1)
+    def completion_done(self, future):
+        if not future.done():
+            return;
 
-    def on_query_completions(self, v, prefix, location):
+        (completion_job_id, suggestions) = future.result()
 
+        if completion_job_id != self.completion_job_id:
+            return;
+
+        self.suggestions = suggestions
+
+        view = sublime.active_window().active_view()
+
+        # hide the completion we might currently see as those are sublime's
+        # own completions
+        view.run_command('hide_auto_complete')
+
+        # trigger a new completion event to show the freshly acquired ones
+        view.run_command('auto_complete', {
+            'disable_auto_insert': True,
+            'api_completions_only': False,
+            'next_competion_if_showing': False})
+
+    def on_query_completions(self, view, prefix, location):
         # check if autocompletion was disabled for this plugin
         if not auto_complete:
-            return [];
-
-        switches = ['-l']  # rc's auto-complete switch
-        self.view = v
-        # libcland does auto-complete _only_ at whitespace and punctuation chars
-        # so "rewind" location to that character
-        location = location[0] - len(prefix)
+            return []
 
         # do nothing if not called from supported code
-        if not supported_file_type(v):
+        if not supported_file_type(view):
             return []
-        # We launch rc utility with both filename:line:col and filename:length
-        # because we're using modified file which is passed via stdin (see --unsaved-file
-        # switch)
-        out, err = run_rc(switches, get_view_text(self.view),
-                          self._query(location),
-                          '--unsaved-file',
-                          # filename:length
-                          '{}:{}'.format(v.file_name(), v.size()),
-                          '--synchronous-completions'  # no async)
-                          )
-        sugs = []
-        for line in out.splitlines():
-            # line is like this
-            # "process void process(CompletionThread::Request *request) CXXMethod"
-            # "reparseTime int reparseTime VarDecl"
-            # "dump String dump() CXXMethod"
-            # "request CompletionThread::Request * request ParmDecl"
-            # we want it to show as process()\tCXXMethod
-            #
-            # output is list of tuples: first tuple element is what we see in popup menu
-            # second is what inserted into file. '$0' is where to place cursor.
-            # TODO play with $1, ${2:int}, ${3:string} and so on
-            elements = line.decode('utf-8').split()
-            sugs.append(('{}\t{}'.format(' '.join(elements[1:-1]), elements[-1]),
-                         '{}$0'.format(elements[0])))
 
-        # inhibit every possible auto-completion
-        return sugs, sublime.INHIBIT_WORD_COMPLETIONS | sublime.INHIBIT_EXPLICIT_COMPLETIONS
+        # libclang does auto-complete _only_ at whitespace and punctuation chars
+        # so "rewind" location to that character
+        trigger_position = location[0] - len(prefix)
 
+        completion_job_id = "CompletionJobId{}".format(trigger_position)
 
-def supported_file_type(view):
-    if settings == None:
-        return False
-    file_types = settings.get('file_types', ["source.c", "source.c++"])
-    return view.scope_name(view.sel()[0].a).split()[0] in file_types
+        # if we have a completion for this position, show that
+        if self.completion_job_id == completion_job_id:
+            return self.suggestions, sublime.INHIBIT_WORD_COMPLETIONS | sublime.INHIBIT_EXPLICIT_COMPLETIONS
+
+        # we need to trigger a new completion
+        job = CompletionJob()
+        self.completion_job_id = completion_job_id
+        text = get_view_text(view)
+        row, col = view.rowcol(trigger_position)
+        filename = view.file_name()
+        size = view.size()
+
+        with RtagsCompleteListener.lock:
+            future = self.pool.submit(job.run, completion_job_id, filename, text, size, row, col)
+            future.add_done_callback(self.completion_done)
+
+        return ([], sublime.INHIBIT_WORD_COMPLETIONS | sublime.INHIBIT_EXPLICIT_COMPLETIONS)
 
 
 def update_settings():
-    suppose_true = ['true', 'True', 'yes', 'Yes', 'totally']
-
     globals()['settings'] = sublime.load_settings(
         'RtagsComplete.sublime-settings')
     globals()['RC_PATH'] = settings.get('rc_path', 'rc')
     globals()['rc_timeout'] = settings.get('rc_timeout', 0.5)
-    globals()['auto_complete'] = settings.get('auto_complete', 'yes') in suppose_true
-    globals()['fixits'] = settings.get('fixits', 'no') in suppose_true
+    globals()['auto_complete'] = settings.get('auto_complete', True)
+    globals()['fixits'] = settings.get('fixits', False)
 
 
 def init():
@@ -432,6 +586,7 @@ def init():
     globals()['navigation_helper'] = NavigationHelper()
     globals()['rc_thread'] = RConnectionThread()
     globals()['progress_indicator'] = ProgressIndicator()
+    globals()['fixits_controller'] = FixitsController()
 
     rc_thread.start()
 
