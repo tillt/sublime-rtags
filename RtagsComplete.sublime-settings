@@ -8,15 +8,15 @@
   /* max number of jump steps */
   "jump_limit": 10,
 
-   /* Supported source file types */
+  /* Supported source file types */
   "file_types": ["source.c", "source.c++", "source.c++.11"],
 
   /* Statusbar indicator key - sorting is done alphabetically */
   "status_key": "rtags_status_indicator",
 
-  /* */
-  "auto_complete": false,
+  /* Enable autocompletion */
+  "auto_complete": true,
 
-  /* */
-  "fixits": false
+  /* Enable displaying fixits, warnings and errors */
+  "fixits": true
 }
